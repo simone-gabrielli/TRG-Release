@@ -128,6 +128,16 @@ def main(args):
         except TypeError:
             continue
 
+        # Prepare combined per-frame overlay only when multiple faces are detected
+        overlay_img_frame = None
+        overlays_dir = None
+        overlay_has_points = False
+        if args.show_features and lmk_preds is not None and len(lmk_preds) > 1:
+            overlay_img_frame = img_full.copy()
+            feat_out_dir = os.path.join(save_img_dir, 'features')
+            overlays_dir = os.path.join(feat_out_dir, 'overlays')
+            os.makedirs(overlays_dir, exist_ok=True)
+
         ############################################
         # Save head bbox
         ############################################
@@ -281,6 +291,7 @@ def main(args):
                             colors = (cm.get_cmap('jet')(norm_s)[:, :3] * 255).astype(np.uint8)
 
                             # draw on a copy of original full image
+                            # draw per-face overlay (keeps previous behavior)
                             overlay_img = img_full.copy()
                             for (x_f, y_f), col in zip(full_pts, colors):
                                 xi, yi = int(round(x_f)), int(round(y_f))
@@ -289,10 +300,19 @@ def main(args):
                                 # col is RGB; convert to BGR for cv2
                                 cv2.circle(overlay_img, (xi, yi), 2, (int(col[2]), int(col[1]), int(col[0])), -1)
 
-                            overlays_dir = os.path.join(feat_out_dir, 'overlays')
-                            os.makedirs(overlays_dir, exist_ok=True)
-                            overlay_path = os.path.join(overlays_dir, f'frame_{frame_i:05d}_face_{i:03d}_overlay.jpg')
-                            cv2.imwrite(overlay_path, overlay_img)
+                            # overlays_dir_per_face = os.path.join(feat_out_dir, 'overlays')
+                            # os.makedirs(overlays_dir_per_face, exist_ok=True)
+                            # overlay_path = os.path.join(overlays_dir_per_face, f'frame_{frame_i:05d}_face_{i:03d}_overlay.jpg')
+                            # cv2.imwrite(overlay_path, overlay_img)
+
+                            # also draw onto the combined per-frame overlay when prepared
+                            if overlay_img_frame is not None:
+                                for (x_f, y_f), col in zip(full_pts, colors):
+                                    xi, yi = int(round(x_f)), int(round(y_f))
+                                    if xi < 0 or yi < 0 or xi >= overlay_img_frame.shape[1] or yi >= overlay_img_frame.shape[0]:
+                                        continue
+                                    cv2.circle(overlay_img_frame, (xi, yi), 2, (int(col[2]), int(col[1]), int(col[0])), -1)
+                                overlay_has_points = True
                         except Exception as e_overlay:
                             print(f'Warning: failed to create overlay for frame {frame_i} face {i}: {e_overlay}')
                 except Exception as e:
@@ -317,6 +337,14 @@ def main(args):
                 rendered_img = render_mesh(rendered_img.copy(), tmp_verts_cam, mesh_faces, focal_length, princpt, alpha=1.0)
                 out_img_path = os.path.join(tmp_render_out_dir, 'frame_%05d_rgb.jpg' % frame_i)
                 cv2.imwrite(out_img_path, rendered_img)
+
+        # Save combined per-frame overlay if created and has points
+        if args.show_features and overlay_img_frame is not None and overlay_has_points and overlays_dir is not None:
+            try:
+                combined_path = os.path.join(overlays_dir, f'frame_{frame_i:05d}_overlay.jpg')
+                cv2.imwrite(combined_path, overlay_img_frame)
+            except Exception as e_save_comb:
+                print(f'Warning: failed to save combined overlay for frame {frame_i}: {e_save_comb}')
 
     ###############################################
     # Save mesh, faces obj
