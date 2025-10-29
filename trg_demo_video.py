@@ -9,6 +9,7 @@ from util.pkl import read_pkl, write_pkl
 from util.vis import plotting_points2d_on_img_cv, render_mesh, draw_axis
 import copy
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import trimesh
 from util.path import get_file_dir_name
 import scipy.io as sio
@@ -21,6 +22,7 @@ from tqdm import tqdm
 from util.img_video_conversion import video2image, image2video
 import argparse
 import time
+from util.feature_utils import extract_mesh_aligned_features, save_mesh_features
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -30,6 +32,7 @@ def parse_args():
     parser.add_argument("--frame_rate", type=int, default=30, help="Path, where logs will be stored")
     parser.add_argument('--do_render', action='store_true', default=False)
     parser.add_argument("--model_path", type=str, default="checkpoint/trg_240717/checkpoint-30/state_dict.bin", help="trg_240717, trg_single_240717")
+    parser.add_argument('--show_features', action='store_true', default=False, help='Overlay and save mesh-aligned features on full image')
     args = parser.parse_args()
     return args
 
@@ -43,7 +46,7 @@ def main(args):
     # video -> images
     ############################################
     # make output directory
-    save_img_dir = demo_video_path.split('.')[0]
+    save_img_dir = "output"
     os.makedirs(save_img_dir, exist_ok=True)
 
     ###############################################
@@ -218,9 +221,9 @@ def main(args):
             with torch.no_grad():
                 img = tfm_test(img)
                 img = img[None, :, :, :].cuda()
-                preds_dict, _ = trg(img, intrinsic_crop, bbox_info)
+                out_list, vis_feat_list = trg(img, intrinsic_crop, bbox_info)
 
-                preds = preds_dict['output'][-1]
+                preds = out_list['output'][-1]
                 pred_vtx_world, pred_R_t, pred_vtx_cam = \
                     preds['pred_face_world'], \
                     preds['pred_R_t'], \
@@ -228,6 +231,73 @@ def main(args):
 
                 # Save all prediction
                 pred_verts_cam_list.append(pred_vtx_cam)
+
+                # --- extract and save mesh-aligned features ---
+                try:
+                    # choose iteration index (use last iteration by default)
+                    rf_i = int(trg.cfg.MODEL.TRG.N_ITER) - 1
+                    # reuse already computed out_list/vis_feat_list to avoid double forward
+                    ref_feature, sampling_points = extract_mesh_aligned_features(trg, img, intrinsic_crop, bbox_info, rf_i=rf_i, device=device, out_list=out_list, vis_feat_list=vis_feat_list)
+
+                    feat_out_dir = os.path.join(save_img_dir, 'features')
+                    feat_path, spath = save_mesh_features(feat_out_dir, frame_i, i, ref_feature, trg, sampling_points=sampling_points)
+
+                    # If requested, overlay features on full image and save
+                    if args.show_features:
+                        try:
+                            # per-point descriptors: [B, N, C]
+                            C_p = int(trg.cfg.MODEL.TRG.MLP_DIM[-1])
+                            B = ref_feature.shape[0]
+                            N = int(ref_feature.shape[1] // C_p)
+                            per_point = ref_feature.view(B, N, C_p).cpu().numpy()
+
+                            # get sampling points in crop pixel coords
+                            if sampling_points is None:
+                                # reconstruct grid sampling positions for rf_i == 0
+                                grid_norm = trg.points_grid.squeeze(0).t().cpu().numpy()  # (N,2) normalized [-1,1]
+                                # map to crop pixels (img_size used earlier)
+                                img_size_local = img.shape[-1]
+                                samp = (grid_norm + 1.0) / 2.0 * (img_size_local - 1)
+                            else:
+                                if isinstance(sampling_points, torch.Tensor):
+                                    samp = sampling_points.cpu().numpy()[0]
+                                else:
+                                    samp = sampling_points[0]
+
+                            # map crop coords back to full image coordinates using tform_inv
+                            pts = samp.reshape(-1, 2)
+                            ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+                            pts_h = np.concatenate([pts, ones], axis=1)  # Nx3
+                            tform_inv_np = np.array(tform_inv, dtype=np.float32)
+                            full_pts = (pts_h @ tform_inv_np.T)  # Nx2
+
+                            # color by mean descriptor per point
+                            scalars = per_point[0].mean(axis=1)
+                            smin, smax = float(scalars.min()), float(scalars.max())
+                            if smax - smin < 1e-8:
+                                norm_s = np.zeros_like(scalars)
+                            else:
+                                norm_s = (scalars - smin) / (smax - smin)
+                            colors = (cm.get_cmap('jet')(norm_s)[:, :3] * 255).astype(np.uint8)
+
+                            # draw on a copy of original full image
+                            overlay_img = img_full.copy()
+                            for (x_f, y_f), col in zip(full_pts, colors):
+                                xi, yi = int(round(x_f)), int(round(y_f))
+                                if xi < 0 or yi < 0 or xi >= overlay_img.shape[1] or yi >= overlay_img.shape[0]:
+                                    continue
+                                # col is RGB; convert to BGR for cv2
+                                cv2.circle(overlay_img, (xi, yi), 2, (int(col[2]), int(col[1]), int(col[0])), -1)
+
+                            overlays_dir = os.path.join(feat_out_dir, 'overlays')
+                            os.makedirs(overlays_dir, exist_ok=True)
+                            overlay_path = os.path.join(overlays_dir, f'frame_{frame_i:05d}_face_{i:03d}_overlay.jpg')
+                            cv2.imwrite(overlay_path, overlay_img)
+                        except Exception as e_overlay:
+                            print(f'Warning: failed to create overlay for frame {frame_i} face {i}: {e_overlay}')
+                except Exception as e:
+                    # don't break inference if feature save fails
+                    print(f'Warning: failed to extract/save features for frame {frame_i} face {i}: {e}')
 
             mesh_each_frame.append(pred_vtx_cam[0].cpu().numpy())
 
